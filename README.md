@@ -16,7 +16,10 @@
 ## 装
 
 ```bash
-# 1) 把它放进某个目录，装进当前 profile
+# 0) 拿到代码：clone 一份（或直接下 zip 解开）
+git clone https://github.com/aaalog/dsh-chat-bridge.git
+
+# 1) 把它装进当前 profile（target 指向上面那个目录）
 plugin_manager install_bundle  /绝对路径/dsh-chat-bridge
 
 # 2) 确认加载了
