@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="chat bridge">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#0b3d91"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#bg)"/>
+  <!-- 两个对话气泡由一座桥连起来：左边人，右边 AI -->
+  <rect x="9" y="16" width="19" height="14" rx="5" fill="#ffffff" opacity="0.95"/>
+  <path d="M13 30 h6 l-3 5 z" fill="#ffffff" opacity="0.95"/>
+  <rect x="36" y="34" width="19" height="14" rx="5" fill="#ffffff" opacity="0.75"/>
+  <path d="M51 34 h-6 l3 -5 z" fill="#ffffff" opacity="0.75"/>
+  <path d="M24 24 C30 24, 30 40, 38 40" stroke="#7ee2a8" stroke-width="2.6"
+        fill="none" stroke-linecap="round"/>
+  <circle cx="24" cy="24" r="2.6" fill="#7ee2a8"/>
+  <circle cx="38" cy="40" r="2.6" fill="#7ee2a8"/>
+</svg>

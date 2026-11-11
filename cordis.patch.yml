@@ -1,0 +1,25 @@
+# dsh-chat-bridge bundle patch：只插一行 host 插件。
+#
+# ⚠️ aiKey 是密钥，**不要**写进版本库。填法二选一：
+#   1) 环境变量 DSH_CHAT_BRIDGE_AI_KEY（优先级高于配置文件）
+#   2) 装好之后在自己的 profile 的 cordis.patch.yml 里补一行同 id 覆盖：
+#        - id: chat-bridge
+#          config:
+#            aiKey: "把你自己的 aiKey 填这儿"
+#
+# 其余字段的默认值写在 lib/config.js 的 DEFAULTS 里，想改同样用上面那行覆盖。
+- insert:
+    - id: chat-bridge
+      name: dsh-chat-bridge
+      config:
+        enabled: true
+        host: "https://api.wna.me"
+        aiKey: ""
+        name: "AI"
+        groupReplyMode: question
+        useWebSocket: true
+        pollFallback: true
+        maxConcurrent: 2
+        loopGuard:
+          chainMax: 3
+          aiMinGapMs: 6000

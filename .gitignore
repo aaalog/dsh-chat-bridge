@@ -1,0 +1,22 @@
+# 依赖/junction（tools/link-deps.mjs 建的）
+node_modules/
+
+# 运行时状态：日志、体检文件、单实例 pid
+bridge.log
+bridge.log.1
+diagnostic.json
+bridge.pid
+*.state.json
+
+# 本地配置与密钥：别进版本库
+config.json
+.env
+.env.*
+*.local.json
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

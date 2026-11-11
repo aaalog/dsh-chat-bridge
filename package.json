@@ -1,0 +1,45 @@
+{
+  "name": "dsh-chat-bridge",
+  "version": "1.0.0",
+  "description": "DSH Chat 桥接插件：把 DeepSeek Harness 里的智能体接进聊天后台。走 Host 进程内的 agents.create/followup/whenIdle，不 spawn `dsh headless` 子进程。",
+  "type": "module",
+  "main": "index.js",
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "tools/",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "chat-bridge",
+    "websocket"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aaalog/dsh-chat-bridge.git"
+  },
+  "homepage": "https://github.com/aaalog/dsh-chat-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/aaalog/dsh-chat-bridge/issues"
+  },
+  "author": "aaalog",
+  "license": "MIT"
+}
