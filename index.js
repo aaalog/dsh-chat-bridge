@@ -1,6 +1,6 @@
 // dsh-chat-bridge —— 把 DSH 智能体接进 WNA HUB 聊天后台（DSH Chat）。
 //
-// 这个插件是独立运行的 ai-bridge 进程的插件化改写。原版是一个单独 node 进程：
+// 这个插件是 app-agent/ai-bridge.js 的插件化改写。原版是一个独立 node 进程：
 // 登录 → 收消息 → 每条 spawn 一次 `dsh headless --json` → 发回复。三个硬伤：
 //   1. 子进程继承沙箱受限令牌，写 profiles/headless 直接 EPERM；
 //   2. 每条消息起一个 headless，慢，而且同一会话并发会撞会话写句柄；
@@ -48,6 +48,17 @@ export const Config = Schema.object({
     burstMax: Schema.number().default(10).description('窗口内接 AI 的话超过这个数就静默'),
     burstWindowMs: Schema.number().default(60000).description('防刷统计窗口（ms）'),
     muteMs: Schema.number().default(60000).description('熔断静默时长（ms）'),
+  }).default({}),
+  proactive: Schema.object({
+    enabled: Schema.boolean().default(true).description('AI 主动发言（不等被回，自己找话说）'),
+    intervalMs: Schema.number().default(90000).description('主动发言检查间隔（ms）'),
+    cooldownMs: Schema.number().default(600000).description('同一会话两次主动发言的最小间隔（ms）'),
+    maxPerHour: Schema.number().default(8).description('全桥接每小时最多主动发言条数'),
+    onlyGroup: Schema.boolean().default(true).description('只对群聊主动发言（单聊等对方说）'),
+  }).default({}),
+  receipt: Schema.object({
+    enabled: Schema.boolean().default(true).description('投递前先回一句「收到，我看一下…」'),
+    text: Schema.string().default('收到，我看一下…').description('回执话术（要被 CANNED 识别，防另一个 AI 接话）'),
   }).default({}),
   typingNotice: Schema.boolean().default(true).description('超过 typingAfterMs 还没好，先发一句「正在想…」'),
   typingAfterMs: Schema.number().default(15000).description('多久之后发提示（ms）'),
@@ -135,7 +146,7 @@ export function apply(ctx, config = {}) {
   /**
    * 单实例闸门。
    *
-   * 为什么要有：一次对刷风暴里，有连续几十条消息全是这个账号发的，
+   * 为什么要有：2026-11-12 那次对刷风暴里，#832–#891 全是小肥鱼账号发的，
    * 但本机日志那段时间一条都没有 —— 说明**别处还有一个同 aiKey 的实例**在跑。
    * 两个实例各听一份 WS，你回我我回你，回路一闭就停不下来。
    * 所以：同一个状态目录只允许一个活进程，第二个直接不连后台，并在状态里写清楚。
@@ -213,7 +224,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** 组提示词（和原版一致的意图，措辞按「先说人话」重写） */
-  const buildPrompt = (msg, conv, recent) => {
+  const buildPrompt = (msg, conv, recent, aiJudge = false) => {
     const senderName = nameMap[msg.sender] || msg.senderName || msg.sender
     const isGroup = (conv?.type === 'group') || convType(msg.convId) === 'group'
     const ctxLines = recent?.length
@@ -226,6 +237,11 @@ export function apply(ctx, config = {}) {
         + `\n最新消息来自 ${senderName}：\n${msg.text || ''}\n\n`
         + '请直接回复。要求：简短自然，像真人聊天；不要说「收到」「好的」这类空话；'
         + '不要解释你在调用什么工具；不要加「回复：」前缀。'
+        + (aiJudge
+          ? '\n\n【自主判断】这条消息如果不需要你回应（对方只是闲聊、没点名你、没有要你做的事、'
+            + '你接不上话），就只回复 SKIP（全大写，除此之外一个字都不要多说）。'
+            + '如果你判断该回应，就正常回复。'
+          : '')
     }
     return `【DSH Chat 私聊】${senderName} 给你发来消息：\n\n${msg.text || ''}\n\n`
       + '请直接回复，简洁自然。'
@@ -233,10 +249,13 @@ export function apply(ctx, config = {}) {
 
   /** 每个会话最近 10 条，给提示词当上下文 */
   const recentByConv = new Map()
+  /** 每个会话最后一次收到消息的时间（主动发言只对最近活跃的会话） */
+  const lastActivityAt = new Map()
   const rememberSeen = (convId, msg) => {
     let arr = recentByConv.get(convId)
     if (!arr) { arr = []; recentByConv.set(convId, arr) }
     if (arr.some((x) => x.seq === msg.seq)) return
+    lastActivityAt.set(convId, Date.now())
     arr.push({
       seq: msg.seq,
       name: nameMap[msg.sender] || msg.senderName || msg.sender,
@@ -275,8 +294,28 @@ export function apply(ctx, config = {}) {
   // ── 「正在想…」提示语（按会话冷却，别刷屏） ──
   const lastNoticeAt = new Map()
 
+  /**
+   * 投一条消息并取回复；整轮被门禁拒绝（blocked）时自动换新会话 id 重投一次。
+   *
+   * 为什么必须有：会话被归档后，resume 回来的每一轮都会在 pre-step 被
+   * ArchivedSessionGate 拒掉 —— reply 是空的、turn/end 是 blocked，从外面看
+   * 就像「模型没话说」，实际是这个群从此哑了。2026-11-12 三个桥接会话
+   * （群聊 + 私聊 + 自检）全在归档列表里，就是这么集体失声的。
+   */
+  const deliverWithRecovery = async (convId, prompt) => {
+    let result = await sessions.deliver(convId, prompt)
+    if (result.endReason !== 'blocked') return result
+    log.warn(`会话 ${result.sessionId} 整轮被拒（blocked，多半是被归档了），换新会话 id 重投一次`)
+    await sessions.reset(convId)
+    result = await sessions.deliver(convId, prompt)
+    if (result.endReason === 'blocked') {
+      log.error('换了新会话仍然 blocked —— 不是归档问题，去查 agent/pre-step 上的门禁插件')
+    }
+    return result
+  }
+
   /** 处理一条该接的消息 */
-  const handleMessage = async (msg, conv) => {
+  const handleMessage = async (msg, conv, verdict = {}) => {
     const convId = msg.convId
     const senderName = nameMap[msg.sender] || msg.senderName || msg.sender
     diagnostics.received += 1
@@ -286,7 +325,15 @@ export function apply(ctx, config = {}) {
     const recent = (recentByConv.get(convId) || [])
       .filter((x) => x.seq !== msg.seq)
       .slice(-10)
-    const prompt = buildPrompt(msg, conv, recent)
+    // 图片/文件消息用 guard 给的 promptOverride；普通消息走 buildPrompt
+    const prompt = verdict.promptOverride || buildPrompt(msg, conv, recent, verdict.aiJudge)
+
+    // 投递前先回执（只对人类消息，长任务时用户立刻知道收到；
+    // 话术能被 CANNED 识别，防另一个 AI 接话）
+    if (msg.senderType !== 'ai' && settings.receipt?.enabled !== false) {
+      const rtext = String(settings.receipt?.text || '收到，我看一下…')
+      try { await api.sendText(convId, rtext); diagnostics.sent += 1 } catch { /* 回执发不出就算了 */ }
+    }
 
     let noticeTimer = null
     if (settings.typingNotice !== false) {
@@ -303,7 +350,7 @@ export function apply(ctx, config = {}) {
     let reply = ''
     let failed = ''
     try {
-      const result = await sessions.deliver(convId, prompt)
+      const result = await deliverWithRecovery(convId, prompt)
       reply = result.text
       if (result.timedOut && !reply) failed = '本轮超时'
     } catch (error) {
@@ -314,6 +361,14 @@ export function apply(ctx, config = {}) {
     }
 
     if (!reply) reply = failed ? `（我这边处理出错了：${failed}）` : '（没有想说的）'
+
+    // 自主判断（群聊 AI 判断场景）：模型觉得不用回就输出 SKIP，不发
+    if (verdict.aiJudge && /^\s*[\[【]?\s*SKIP\s*[\]】]?\s*$/i.test(reply)) {
+      diagnostics.skipped += 1
+      log.info(`AI 判断不接 #${msg.seq}（SKIP）`)
+      if (noticeTimer) clearTimeout(noticeTimer)
+      return
+    }
 
     try {
       await api.sendText(convId, reply)
@@ -344,7 +399,7 @@ export function apply(ctx, config = {}) {
     }
     // 先排会话串行锁，再抢全局并发槽 —— 顺序反过来会让「同一会话的第二条消息」
     // 白占一个并发槽等前面那条跑完，别的会话就被饿着。
-    await withConvLock(convId, () => limited(() => handleMessage(msg, conv)))
+    await withConvLock(convId, () => limited(() => handleMessage(msg, conv, verdict)))
   }
 
   const submitInbound = (msg) => {
@@ -354,6 +409,75 @@ export function apply(ctx, config = {}) {
     void onInbound(msg)
       .catch((error) => { log.error(`入站处理失败：${error?.stack ?? error}`) })
       .catch(() => { /* 绝不能再抛 */ })
+  }
+
+  // ── AI 主动发言：像人一样自己找话说，不等被回 ──
+  const proactive = {
+    lastAt: new Map(),  // convId → 上次主动发言时间
+    thisHour: [],       // 主动发言时间戳（防每小时上限）
+  }
+  const proactiveTimer = { t: null }
+
+  const buildProactivePrompt = (convId, conv) => {
+    const recent = (recentByConv.get(convId) || []).slice(-8)
+    const ctxLines = recent.length
+      ? recent.map((x) => `  ${x.name}：${x.text}`).join('\n')
+      : '（还没有最近消息）'
+    const gname = conv?.name || '群聊'
+    return `【DSH Chat 群聊「${gname}」· 主动发言】\n`
+      + `你是群成员「${api.me?.displayName || settings.name}」。最近会话消息：\n${ctxLines}\n\n`
+      + '你不用等别人回，自己判断：现在有没有一句值得你主动说的？'
+      + '（比如接着刚才的话题补充一句、提醒一句、汇报进度、接上话茬）\n'
+      + '- 如果有一句值得说：直接说那一句（简短自然，像真人，不要前缀，不要「回复：」）。\n'
+      + '- 如果没有值得主动说的：只回复 SKIP（全大写，一个字都别多说）。'
+  }
+
+  const proactiveSpeak = async (convId) => {
+    if (settings.proactive?.onlyGroup !== false) {
+      const conv = describeConv(convId)
+      if (conv?.type !== 'group' && !String(convId).startsWith('grp:')) return
+    }
+    const now = Date.now()
+    // 只对最近活跃的会话主动（比如 30 分钟内有人说过话）
+    const lastAct = lastActivityAt.get(convId) ?? 0
+    if (now - lastAct > 30 * 60 * 1000) return
+    const last = proactive.lastAt.get(convId) ?? 0
+    if (now - last < Number(settings.proactive?.cooldownMs ?? 600000)) return
+    proactive.thisHour = proactive.thisHour.filter((t) => now - t < 3600000)
+    if (proactive.thisHour.length >= Number(settings.proactive?.maxPerHour ?? 8)) return
+
+    const conv = describeConv(convId)
+    const prompt = buildProactivePrompt(convId, conv)
+    try {
+      const result = await deliverWithRecovery(convId, prompt)
+      const reply = String(result?.text ?? '')
+      if (!reply || /^\s*[\[【]?\s*SKIP\s*[\]】]?\s*$/i.test(reply)) return  // 没说，等下次
+      proactive.lastAt.set(convId, now)
+      proactive.thisHour.push(now)
+      await api.sendText(convId, reply)
+      diagnostics.sent += 1
+      log.info(`主动发言 → ${reply.slice(0, 60).replace(/\n/g, ' ')}`)
+      writeDiagnostics()
+    } catch (error) {
+      log.error(`主动发言失败：${error?.message ?? error}`)
+    }
+  }
+
+  const startProactive = () => {
+    if (settings.proactive?.enabled === false) {
+      log.info('主动发言已关闭（proactive.enabled=false）')
+      return
+    }
+    const interval = Number(settings.proactive?.intervalMs ?? 90000)
+    proactiveTimer.t = setInterval(() => {
+      if (closing) return
+      for (const convId of recentByConv.keys()) {
+        void withConvLock(convId, () => limited(() => proactiveSpeak(convId)))
+          .catch(() => {})
+      }
+    }, interval)
+    proactiveTimer.t.unref?.()
+    log.info(`主动发言已启动（间隔 ${interval / 1000}s，冷却 ${Number(settings.proactive?.cooldownMs ?? 600000) / 60000}min/会话）`)
   }
 
   // ── 长轮询（WS 的退路） ──
@@ -433,6 +557,8 @@ export function apply(ctx, config = {}) {
     heartbeatTimer.unref?.()
 
     await refreshNames()
+
+    startProactive()
 
     if (settings.useWebSocket !== false) {
       receiver = createReceiver({
@@ -514,6 +640,10 @@ export function apply(ctx, config = {}) {
               type: 'boolean',
               description: '真的跑一轮会话，验证取回复的链路（默认 false）',
             },
+            key: {
+              type: 'string',
+              description: '自检用哪个会话键（默认每次新建；传同一个键可复现「重启后 resume 旧会话」）',
+            },
           },
           additionalProperties: false,
         },
@@ -527,10 +657,19 @@ export function apply(ctx, config = {}) {
           if (args?.selftest) {
             const started = Date.now()
             try {
-              const probe = await sessions.deliver('__selftest__', '自检：请只回复两个字「正常」，不要用任何工具。')
+              // 默认每次换一个新 convId：固定 key 的会话一旦被历史事件污染（比如某次
+              // pre-step 被门禁 block 之后留下脏状态），下次自检会误报「取回复链路坏了」，
+              // 分不清是链路坏还是那个会话坏了。新 key 每次都是干净的 create。
+              // 传了 key 就复用 —— 那是复现「插件重启后 resume 同一个会话」用的，
+              // 真人消息最常踩的正是这条路径。
+              const fixedKey = String(args?.key ?? '').trim()
+              const probeKey = fixedKey || `__selftest_${started.toString(36)}`
+              const probe = await deliverWithRecovery(probeKey, '自检：请只回复两个字「正常」，不要用任何工具。')
               const cost = ((Date.now() - started) / 1000).toFixed(1)
-              selftestLine = `自检：会话 ${probe.sessionId} · ${cost}s · `
-                + `${probe.timedOut ? '超时' : '完成'} · 取回 ${probe.text ? `${probe.text.length} 字：「${probe.text.slice(0, 40)}」` : '**0 字（取回复的链路有问题）**'}`
+              selftestLine = `自检：${probeKey} → 会话 ${probe.sessionId} · ${cost}s · `
+                + `${probe.timedOut ? '超时' : '完成'}`
+                + `${probe.endReason ? ` · 收尾=${probe.endReason}` : ''}`
+                + ` · 取回 ${probe.text ? `${probe.text.length} 字：「${probe.text.slice(0, 40)}」` : '**0 字（取回复的链路有问题）**'}`
             } catch (error) {
               selftestLine = `自检：失败 ${error?.message ?? error}`
             }
@@ -615,6 +754,50 @@ export function apply(ctx, config = {}) {
           }
         },
       })
+
+      // 手动重置：把一个会话的桥接上下文换成全新会话。会话被归档（每轮 blocked）
+      // 或者上下文被聊脏了的时候用。不发消息，只换 id。
+      tools.register({
+        name: 'chat_bridge_reset',
+        description: '把 DSH Chat 某个会话的桥接上下文重置成全新会话（会话被归档/每轮 '
+          + 'blocked、或者上下文聊脏了时用）。convId 和 to 二选一，to 是会话名（群名/对方名字）。'
+          + '只换 DSH 会话 id，不会往聊天里发任何消息。',
+        parameters: {
+          type: 'object',
+          properties: {
+            convId: { type: 'string', description: '目标会话 id' },
+            to: { type: 'string', description: '目标会话名（群名/对方名字）' },
+          },
+          additionalProperties: false,
+        },
+        output: TEXT_OUTPUT,
+        async execute(args) {
+          let convId = String(args?.convId ?? '').trim()
+          if (!convId) {
+            const to = String(args?.to ?? '').trim()
+            if (!to) return { text: '要给 convId 或 to（会话名）。' }
+            await refreshNames()
+            convId = convByName.get(to) ?? ''
+            if (!convId) {
+              const byMember = memberIndex.get(to)
+              if (byMember && byMember.size === 1) convId = [...byMember][0]
+              else if (byMember && byMember.size > 1) {
+                return { text: `「${to}」出现在多个会话里：${[...byMember].join(', ')}。请用 convId 指定。` }
+              }
+            }
+            if (!convId) return { text: `找不到会话「${to}」。` }
+          }
+          const before = sessions.findByConvId(convId)?.sessionId ?? ''
+          try {
+            const record = await sessions.reset(convId)
+            writeDiagnostics()
+            log.info(`手动重置会话 ${convId}：${before || '(无)'} → ${record.sessionId}`)
+            return { text: `已重置 ${convId}\n  旧会话：${before || '(无)'}\n  新会话：${record.sessionId}` }
+          } catch (error) {
+            return { text: `重置失败：${error?.message ?? error}` }
+          }
+        },
+      })
     })
   }
 
@@ -638,6 +821,7 @@ export function apply(ctx, config = {}) {
     log.info('插件卸载：停收消息、断连接、卸会话')
     try { receiver?.close() } catch { /* 已断 */ }
     if (heartbeatTimer) clearInterval(heartbeatTimer)
+    if (proactiveTimer.t) clearInterval(proactiveTimer.t)
     try {
       void sessions.disposeAll()
         .catch((error) => { log.warn(`卸会话失败：${error?.message ?? error}`) })

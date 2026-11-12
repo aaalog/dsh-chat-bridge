@@ -43,22 +43,29 @@ plugin_manager set_plugin  <entryId>  enabled=true
 
 ## 配
 
-密钥走环境变量，别写进版本库：
+插件包里的 `cordis.patch.yml` 是**模板**：`aiKey: ""`、`name: "AI"`、`cwd: ""`。
+身份相关的三项请写在你**自己 profile** 的 `cordis.patch.yml` 里（同 id 覆盖），
+不要改包里那个 —— 它是插件的一部分，会随代码一起更新。
+
+密钥也可以走环境变量，那样连覆盖层都不用写：
 
 ```bash
 export DSH_CHAT_BRIDGE_AI_KEY=ak_xxxxxxxx     # 或 DSH_CHAT_BRIDGE_HOST
 ```
 
-其余字段在 `cordis.patch.yml` 那一行里，或在你自己 profile 的 `cordis.patch.yml`
-里补一行同 id 覆盖：
+覆盖写法：
 
 ```yaml
 - id: chat-bridge
   config:
-    name: "小助手"
-    groupReplyMode: question
-    loopGuard: { chainMax: 2, aiMinGapMs: 8000 }
+    aiKey: "你自己的 key"
+    name: "你自己的名字"
+    cwd: "你自己的目录"
 ```
+
+> ⚠️ **一个 `aiKey` = 一个 AI 身份，绝不能和别人的实例共用（跨机器也算）。**
+> 两个实例同时听同一个后台，就是互相接话、几秒刷出上百条 —— 本插件所有防对刷
+> 机制（单实例闸门）都只管本机，管不住另一台机器。换人用就换 key。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -74,6 +81,8 @@ export DSH_CHAT_BRIDGE_AI_KEY=ak_xxxxxxxx     # 或 DSH_CHAT_BRIDGE_HOST
 | `loopGuard.*` | 3 / 6000 / 10 / 60000 / 60000 | 防对刷刹车，见下 |
 | `typingNotice` / `typingAfterMs` / `typingCooldownMs` | true / 15000 / 60000 | 慢的时候先发一句「正在想…」 |
 | `allowMultiInstance` | false | 允许同 aiKey 本机多开（默认禁止） |
+| `proactive.*` | 开 / 90s / 10min / 8 条 / 只群聊 | AI 主动发言（不等被回，自己找话说） |
+| `receipt.*` | 开 /「收到，我看一下…」 | 投递前先回一句回执，话术会被固定话术过滤器识别 |
 | `legacyConfigPath` | 空 | 从老桥接迁移时指过去，继承 host/aiKey/name/cwd |
 | `promptEnabled` / `promptText` | true / 空 | 给桥接会话注入的聊天场景提示 |
 | `tools.enabled` | true | 注册 `chat_bridge_*` 工具 |
@@ -110,12 +119,26 @@ export DSH_CHAT_BRIDGE_AI_KEY=ak_xxxxxxxx     # 或 DSH_CHAT_BRIDGE_HOST
   任何东西），验证「建会话 → 投消息 → 取回复」这条链路。这是本插件唯一「改错了不
   报错、只在真人发消息时才炸」的地方，所以留了个能随时按的按钮。
 - **`chat_bridge_send`** —— 主动往某个会话发一条（`convId` 或会话名 `to`）。
+- **`chat_bridge_reset`** —— 把一个会话的桥接上下文换成**全新会话**（`convId` 或 `to`）。
+  会话被归档、每轮 `blocked`、或者上下文聊脏了的时候用；只换 session id，不发任何消息。
 
 ## 会话与上下文
 
 `convId` → `sha256("dsnchat:conv:<convId>")` → uuid 形状的 `SessionId`。同一个会话
 永远落在同一个 DSH session 上，插件/Harness 重启后 `resume` 回来，上下文不断。
-想强制断上下文就改 `sessionPrefix`。
+想强制断上下文就改 `sessionPrefix`，或者调 `chat_bridge_reset`。
+
+### ⚠️ 会话被归档 = 这个群从此哑掉
+
+DSH 里有个 `ArchivedSessionGate`：会话一旦进了 workspace 的 `archivedSessionIds`，
+`resume` 回来的每一轮都会在 `agent/pre-step` 被直接 reject，`turn/end` 记成
+`blocked` —— 消息全被丢弃、一条回复都出不来，而且**不报错**，从外面看就是
+「模型没话说」。清理会话列表时很容易顺手把桥接会话归档掉，然后整条链路静默死亡
+（2026-11-12 就是这么哑掉的：群聊、私聊、自检三个会话全在归档列表里）。
+
+插件对此有自愈：投递时读到 `turn/end: blocked` → 记一行 warn → 换一个带盐的新
+`SessionId` 重投一次。盐落在 `~/.dsh/plugin-data/chat-bridge/session-salt.json`，
+重启后还记得换过的 id，不会每次重启都重撞同一堵墙。
 
 ## 实现上的三个坑
 
@@ -153,14 +176,20 @@ export DSH_CHAT_BRIDGE_AI_KEY=ak_xxxxxxxx     # 或 DSH_CHAT_BRIDGE_HOST
 | 每条消息都「本轮运行失败」 | 模型路由没给（`{{model}}` 为空）→ 配 `provider` / `model` |
 | 没连后台，日志说已有实例在跑 | 单实例闸门命中了，先确认老进程还活着 |
 | 状态是 `inactive` | 模块没加载起来：多半是依赖没链接（见坑 2） |
+| 收到消息，但回复是空的 /「（没有想说的）」 | 这一轮 `turn/end` 是 `blocked` —— 会话被归档了。插件会自动换新会话重投，日志里有一行「整轮被拒（blocked…）」 |
+| 换了新会话还是 `blocked` | 不是归档问题，去查 `agent/pre-step` 上还有哪个插件在 reject（`tools/probe-asar.cjs` 能全库搜钩子） |
 
 ## 自测
 
 ```bash
-node tools/selftest.mjs
+node tools/selftest.mjs                     # 纯逻辑：接话判断 + 配置合并，不联网、不建会话
+node tools/probe-asar.cjs "agent/pre-step"  # 全 asar 搜钩子（要 ELECTRON_RUN_AS_NODE=1）
+node tools/probe-agent.cjs followup         # 只搜 dsh-agent / dsh-agent-loop 两个包
 ```
 
-纯逻辑自测（接话判断 + 配置合并），不联网、不建会话。
+还有一条端到端自检：让模型调 `chat_bridge_status`，带 `selftest: true` —— 会真的
+建会话跑一轮，但**不往聊天里发任何东西**。默认每次换一个新的会话键；传 `key` 可以
+复用同一个键，用来复现「重启后 resume 旧会话」这条最容易出问题的路径。
 
 ## License
 

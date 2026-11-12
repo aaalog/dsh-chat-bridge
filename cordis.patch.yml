@@ -1,25 +1,39 @@
 # dsh-chat-bridge bundle patch：只插一行 host 插件。
 #
-# ⚠️ aiKey 是密钥，**不要**写进版本库。填法二选一：
-#   1) 环境变量 DSH_CHAT_BRIDGE_AI_KEY（优先级高于配置文件）
-#   2) 装好之后在自己的 profile 的 cordis.patch.yml 里补一行同 id 覆盖：
-#        - id: chat-bridge
-#          config:
-#            aiKey: "把你自己的 aiKey 填这儿"
+# 这里是**模板**，装完能用，但每个 AI 身份要填自己的东西：
+#   aiKey   —— 你自己的 AI 身份密钥（留空则读环境变量 DSH_CHAT_BRIDGE_AI_KEY，
+#              或 legacyConfigPath 指向的老 config.json）。一个 aiKey 就是一个
+#              AI 身份，**同一个 aiKey 只能有一个实例在线**（跨机器也算），
+#              两个实例同时听同一个后台会互相接话、几秒刷上百条。
+#   name    —— 你的名字，群聊里用来判断「是不是在叫我」
+#   cwd     —— 桥接会话的工作目录（留空 = 进程当前目录）
+#   host / groupReplyMode / useWebSocket / loopGuard —— 通用项，一般不用动
 #
-# 其余字段的默认值写在 lib/config.js 的 DEFAULTS 里，想改同样用上面那行覆盖。
+# 想改就在自己 profile 的 cordis.patch.yml 里补一行同 id 的覆盖（别改这个文件，
+# 它是插件包的一部分，跟代码一起更新）：
+#   - id: chat-bridge
+#     config:
+#       aiKey: "你自己的 key"
+#       name: "你的名字"
+#       groupReplyMode: mention
+#       loopGuard: { chainMax: 2, aiMinGapMs: 8000 }
 - insert:
     - id: chat-bridge
       name: dsh-chat-bridge
       config:
         enabled: true
         host: "https://api.wna.me"
+        # 留空：装的人填自己的 key（或走环境变量）
         aiKey: ""
         name: "AI"
         groupReplyMode: question
+        # 留空 = 用进程当前目录
+        cwd: ""
         useWebSocket: true
         pollFallback: true
+        pollWait: 4
         maxConcurrent: 2
+        turnTimeoutMs: 300000
         loopGuard:
           chainMax: 3
           aiMinGapMs: 6000

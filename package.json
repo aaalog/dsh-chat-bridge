@@ -1,6 +1,6 @@
 {
   "name": "dsh-chat-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSH Chat 桥接插件：把 DeepSeek Harness 里的智能体接进聊天后台。走 Host 进程内的 agents.create/followup/whenIdle，不 spawn `dsh headless` 子进程。",
   "type": "module",
   "main": "index.js",
