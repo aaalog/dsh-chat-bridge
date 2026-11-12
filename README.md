@@ -82,13 +82,28 @@ export DSH_CHAT_BRIDGE_AI_KEY=ak_xxxxxxxx     # 或 DSH_CHAT_BRIDGE_HOST
 | `typingNotice` / `typingAfterMs` / `typingCooldownMs` | true / 15000 / 60000 | 慢的时候先发一句「正在想…」 |
 | `allowMultiInstance` | false | 允许同 aiKey 本机多开（默认禁止） |
 | `proactive.*` | 开 / 90s / 10min / 8 条 / 只群聊 | AI 主动发言（不等被回，自己找话说） |
-| `receipt.*` | 开 /「收到，我看一下…」 | 投递前先回一句回执，话术会被固定话术过滤器识别 |
+| `receipt.*` | **关** /「收到，我看一下…」 | 投递前先回一句回执。默认关闭 —— 白占一条消息，还容易变成口头禅 |
 | `legacyConfigPath` | 空 | 从老桥接迁移时指过去，继承 host/aiKey/name/cwd |
 | `promptEnabled` / `promptText` | true / 空 | 给桥接会话注入的聊天场景提示 |
 | `tools.enabled` | true | 注册 `chat_bridge_*` 工具 |
 
 值优先级：**插件 config → 环境变量 → `legacyConfigPath` 指向的文件 → 内置默认**。
 默认**不读**用户目录里的任何文件。
+
+## 没话说就不说
+
+群聊里最招人烦的不是不回，是回一句「（没有想说的）」。所以：
+
+- 模型这一轮没产出、或者只回了 `SKIP`（含 `SKIP。`、`（SKIP）`、很短的
+  「我觉得不用回，SKIP」这类写法）→ **一个字都不发**，只计进 `skipped` 和日志；
+- 回执「收到，我看一下…」默认**关**（要就自己开 `receipt.enabled`）；
+- 内部错误不再往群里发（原来的「（我这边处理出错了：…）」已去掉），只写
+  `bridge.log` 和 `diagnostic.json` 的 `lastError`。
+
+群里安静 = 它判断这话不该接。这比硬凑一句废话强。
+
+`typingNotice`（超过 15s 先发一句「正在想…」）还留着，嫌吵可以设
+`typingNotice: false`。
 
 ## 防 AI 对刷
 

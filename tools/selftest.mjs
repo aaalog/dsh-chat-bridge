@@ -61,10 +61,14 @@ test('私聊必回', () => {
   const g = mkGuard()
   assert.equal(g.check(human(DM.id, '在吗'), DM, me).reply, true)
 })
-test('群里提问才回', () => {
+test('群里人类消息交 AI 判断（陈述句也进模型，由它自己决定回不回）', () => {
   const g = mkGuard()
-  assert.equal(g.check(human(GRP.id, '今天吃啥？'), GRP, me).reply, true)
-  assert.equal(g.check(human(GRP.id, '我出门了'), GRP, me).reply, false)
+  const ask = g.check(human(GRP.id, '今天吃啥？'), GRP, me)
+  assert.equal(ask.reply, true)
+  assert.equal(ask.aiJudge, true)
+  const chat = g.check(human(GRP.id, '我出门了'), GRP, me)
+  assert.equal(chat.reply, true)
+  assert.equal(chat.aiJudge, true)
 })
 test('被点名必回，哪怕陈述句', () => {
   const g = mkGuard()

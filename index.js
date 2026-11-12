@@ -57,8 +57,10 @@ export const Config = Schema.object({
     onlyGroup: Schema.boolean().default(true).description('只对群聊主动发言（单聊等对方说）'),
   }).default({}),
   receipt: Schema.object({
-    enabled: Schema.boolean().default(true).description('投递前先回一句「收到，我看一下…」'),
-    text: Schema.string().default('收到，我看一下…').description('回执话术（要被 CANNED 识别，防另一个 AI 接话）'),
+    enabled: Schema.boolean().default(false)
+      .description('投递前先回一句「收到，我看一下…」（默认关闭：没人喜欢开场白）'),
+    text: Schema.string().default('收到，我看一下…')
+      .description('回执话术（只在 enabled 打开时用；这句子会被 CANNED 识别，防另一个 AI 接话）'),
   }).default({}),
   typingNotice: Schema.boolean().default(true).description('超过 typingAfterMs 还没好，先发一句「正在想…」'),
   typingAfterMs: Schema.number().default(15000).description('多久之后发提示（ms）'),
@@ -235,16 +237,16 @@ export function apply(ctx, config = {}) {
         + `你是群成员「${api.me?.displayName || settings.name}」。\n`
         + ctxLines
         + `\n最新消息来自 ${senderName}：\n${msg.text || ''}\n\n`
-        + '请直接回复。要求：简短自然，像真人聊天；不要说「收到」「好的」这类空话；'
+        + '有想说的就直接说，没什么可说的就别硬凑。要求：简短自然，像真人聊天；'
+        + '不要用「收到」「好的」「我看一下」这类空话开场；'
         + '不要解释你在调用什么工具；不要加「回复：」前缀。'
         + (aiJudge
-          ? '\n\n【自主判断】这条消息如果不需要你回应（对方只是闲聊、没点名你、没有要你做的事、'
-            + '你接不上话），就只回复 SKIP（全大写，除此之外一个字都不要多说）。'
-            + '如果你判断该回应，就正常回复。'
+          ? '\n\n【想不想回，你自己判断】不需要你回应的时候就只回复 SKIP（全大写，别的一个字都不写）——'
+            + 'SKIP 不会被发出去，等于你选择不说话。该回应就正常说。'
           : '')
     }
     return `【DSH Chat 私聊】${senderName} 给你发来消息：\n\n${msg.text || ''}\n\n`
-      + '请直接回复，简洁自然。'
+      + '有想说的就说，简洁自然；确实没什么可说就不用硬凑（只回 SKIP，我不会把它发出去）。'
   }
 
   /** 每个会话最近 10 条，给提示词当上下文 */
@@ -314,6 +316,20 @@ export function apply(ctx, config = {}) {
     return result
   }
 
+  /**
+   * 「这一轮模型其实不想说话」的判定。
+   *
+   * 提示词要求「不想说就只回 SKIP」，但模型经常回「SKIP。」「（SKIP）」
+   * 「我觉得不用回，SKIP」—— 只认纯 SKIP 的正则会把这些当正文发到群里。
+   * 这里放宽成：整句很短、并且带 SKIP 字样，就当它不想说。
+   */
+  const isSkipReply = (text) => {
+    const t = String(text ?? '').trim()
+    if (!t) return true
+    if (/^\s*[\[【（(]?\s*SKIP\s*[\]】）)]?\s*[。.!！]*\s*$/i.test(t)) return true
+    return /skip/i.test(t) && t.length <= 24
+  }
+
   /** 处理一条该接的消息 */
   const handleMessage = async (msg, conv, verdict = {}) => {
     const convId = msg.convId
@@ -328,11 +344,12 @@ export function apply(ctx, config = {}) {
     // 图片/文件消息用 guard 给的 promptOverride；普通消息走 buildPrompt
     const prompt = verdict.promptOverride || buildPrompt(msg, conv, recent, verdict.aiJudge)
 
-    // 投递前先回执（只对人类消息，长任务时用户立刻知道收到；
-    // 话术能被 CANNED 识别，防另一个 AI 接话）
-    if (msg.senderType !== 'ai' && settings.receipt?.enabled !== false) {
-      const rtext = String(settings.receipt?.text || '收到，我看一下…')
-      try { await api.sendText(convId, rtext); diagnostics.sent += 1 } catch { /* 回执发不出就算了 */ }
+    // 投递前回执：默认**关闭**。想看「收到了，在处理」就自己把 receipt.enabled 打开。
+    if (msg.senderType !== 'ai' && settings.receipt?.enabled === true) {
+      const rtext = String(settings.receipt?.text || '').trim()
+      if (rtext) {
+        try { await api.sendText(convId, rtext); diagnostics.sent += 1 } catch { /* 回执发不出就算了 */ }
+      }
     }
 
     let noticeTimer = null
@@ -360,13 +377,27 @@ export function apply(ctx, config = {}) {
       if (noticeTimer) clearTimeout(noticeTimer)
     }
 
-    if (!reply) reply = failed ? `（我这边处理出错了：${failed}）` : '（没有想说的）'
+    // 没话说就是没话说：不再往聊天里塞「（没有想说的）」，也不把内部错误原文发出去。
+    // 群里安静比冒一句废话强；原因都写进日志和 diagnostic.json。
+    if (!reply) {
+      diagnostics.skipped += 1
+      if (failed) {
+        diagnostics.lastError = failed
+        log.warn(`#${msg.seq} 本轮没有产出（${failed}），不回话`)
+      } else {
+        log.info(`#${msg.seq} 模型没有回复内容，不回话`)
+      }
+      if (noticeTimer) clearTimeout(noticeTimer)
+      writeDiagnostics()
+      return
+    }
 
-    // 自主判断（群聊 AI 判断场景）：模型觉得不用回就输出 SKIP，不发
-    if (verdict.aiJudge && /^\s*[\[【]?\s*SKIP\s*[\]】]?\s*$/i.test(reply)) {
+    // 模型自己判断「不用回」：SKIP /（SKIP）/ SKIP。 一律不发
+    if (isSkipReply(reply)) {
       diagnostics.skipped += 1
       log.info(`AI 判断不接 #${msg.seq}（SKIP）`)
       if (noticeTimer) clearTimeout(noticeTimer)
+      writeDiagnostics()
       return
     }
 
@@ -451,7 +482,7 @@ export function apply(ctx, config = {}) {
     try {
       const result = await deliverWithRecovery(convId, prompt)
       const reply = String(result?.text ?? '')
-      if (!reply || /^\s*[\[【]?\s*SKIP\s*[\]】]?\s*$/i.test(reply)) return  // 没说，等下次
+      if (isSkipReply(reply)) return  // 没说，等下次
       proactive.lastAt.set(convId, now)
       proactive.thisHour.push(now)
       await api.sendText(convId, reply)
